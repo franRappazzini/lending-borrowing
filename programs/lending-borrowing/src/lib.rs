@@ -39,4 +39,12 @@ pub mod lending_borrowing {
     pub fn borrow_token(ctx: Context<BorrowToken>, amount: u64) -> Result<()> {
         borrow_token::process_borrow_token(ctx, amount)
     }
+
+    pub fn repay_token(ctx: Context<RepayToken>, amount: u64) -> Result<()> {
+        repay_token::process_repay_token(ctx, amount)
+    }
+
+    pub fn liquidate_position(ctx: Context<LiquidatePosition>) -> Result<()> {
+        liquidate_position::process_liquidate_position(ctx)
+    }
 }

@@ -5,7 +5,9 @@ use anchor_spl::{
 };
 use pyth_solana_receiver_sdk::price_update::{get_feed_id_from_hex, PriceUpdateV2};
 
-use crate::{Bank, DappError, User};
+use crate::{
+    calculate_accrued_interest, Bank, DappError, User, MAX_AGE, SOL_USD_FEED_ID, USDC_USD_FEED_ID,
+};
 
 #[derive(Accounts)]
 pub struct BorrowToken<'info> {
@@ -53,32 +55,31 @@ pub struct BorrowToken<'info> {
 }
 
 pub fn process_borrow_token(ctx: Context<BorrowToken>, amount: u64) -> Result<()> {
-    // check total_deposited from user
     let user = &mut ctx.accounts.user;
-
-    let user_total_deposited = if ctx.accounts.mint_account.key() == user.usdc_address {
-        user.deposited_sol
-    } else {
-        user.deposited_usdc
-    };
-
-    require!(
-        amount > user_total_deposited,
-        DappError::InsufficientBalance
-    );
-
-    // calculate how many tokens can borrow
-
-    // getting sol/usd price from pyth oracle
+    let bank = &mut ctx.accounts.bank;
     let price_update = &mut ctx.accounts.price_update;
-    // get_price_no_older_than will fail if the price update is more than 30 seconds old
-    let maximum_age: u64 = 30;
-    // get_price_no_older_than will fail if the price update is for a different price feed.
-    // This string is the id of the BTC/USD feed. See https://pyth.network/developers/price-feed-ids for all available IDs.
-    let feed_id: [u8; 32] = get_feed_id_from_hex("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE")?; // SOL/USD
-    let price = price_update.get_price_no_older_than(&Clock::get()?, maximum_age, &feed_id)?;
-    // Sample output:
-    // The price is (7160106530699 ± 5129162301) * 10^-8
+
+    let (feed_id, deposited): ([u8; 32], u64) =
+        if ctx.accounts.mint_account.key() == user.usdc_address {
+            (get_feed_id_from_hex(SOL_USD_FEED_ID)?, user.deposited_sol)
+        } else {
+            (get_feed_id_from_hex(USDC_USD_FEED_ID)?, user.deposited_usdc)
+        };
+
+    let clock = Clock::get()?;
+    let price = price_update.get_price_no_older_than(&clock, MAX_AGE, &feed_id)?;
+
+    let new_value = calculate_accrued_interest(deposited, bank.interest_rate, user.last_updated)?;
+    let total_collateral = price.price as u64 * new_value;
+
+    let borrowable_amount = total_collateral
+        .checked_mul(bank.max_ltv) // probablemente max_ltv en base 1000 (por ej: 750 == 75%)
+        .unwrap()
+        .checked_div(1_000) // normalizar
+        .unwrap();
+
+    require!(amount <= borrowable_amount, DappError::OverBorrowableAmount);
+
     msg!(
         "The price is ({} ± {}) * 10^{}",
         price.price,
@@ -86,7 +87,6 @@ pub fn process_borrow_token(ctx: Context<BorrowToken>, amount: u64) -> Result<()
         price.exponent
     );
 
-    // send tokens
     let mint_account_key = ctx.accounts.mint_account.key();
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"treasury".as_ref(),
@@ -109,7 +109,25 @@ pub fn process_borrow_token(ctx: Context<BorrowToken>, amount: u64) -> Result<()
         ctx.accounts.mint_account.decimals,
     )?;
 
-    // update bank and user accounts
+    // actualizar bank y user
+    let user_shares = if bank.total_borrowed == 0 || bank.total_borrow_shares == 0 {
+        amount // 1:1 si es el primero
+    } else {
+        ((amount as f64 / bank.total_borrowed as f64) * bank.total_borrow_shares as f64) as u64
+    };
+
+    bank.total_borrowed += amount;
+    bank.total_borrow_shares += user_shares;
+    bank.last_updated_borrowed = clock.unix_timestamp;
+
+    user.last_updated_borrowed = clock.unix_timestamp;
+    if ctx.accounts.mint_account.key() == user.usdc_address {
+        user.borrowed_usdc += amount;
+        user.borrowed_usdc_shares += user_shares;
+    } else {
+        user.borrowed_sol += amount;
+        user.borrowed_sol_shares += user_shares;
+    }
 
     Ok(())
 }
